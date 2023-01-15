@@ -43,6 +43,8 @@ pub enum Frame<B> {
     PushPromise(PushPromise),
     Goaway(StreamId),
     MaxPushId(StreamId),
+    WebTransportBiStream(Bytes),
+    WebTransportUniStream(Bytes),
     Grease,
 }
 
@@ -84,6 +86,8 @@ impl Frame<PayloadLen> {
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
             FrameType::GOAWAY => Ok(Frame::Goaway(payload.get_var()?.try_into()?)),
             FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
+            FrameType::WEBTRANSPORT_BISTREAM => Ok(Frame::WebTransportBiStream(payload.copy_to_bytes(len as usize))),
+            FrameType::WEBTRANSPORT_UNISTREAM => Ok(Frame::WebTransportUniStream(payload.copy_to_bytes(len as usize))),
             FrameType::H2_PRIORITY
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
@@ -124,6 +128,8 @@ where
             Frame::CancelPush(id) => simple_frame_encode(FrameType::CANCEL_PUSH, *id, buf),
             Frame::Goaway(id) => simple_frame_encode(FrameType::GOAWAY, *id, buf),
             Frame::MaxPushId(id) => simple_frame_encode(FrameType::MAX_PUSH_ID, *id, buf),
+            Frame::WebTransportBiStream(_) => todo!(),
+            Frame::WebTransportUniStream(_) => todo!(),
             Frame::Grease => {
                 FrameType::grease().encode(buf);
                 buf.write_var(6);
@@ -185,6 +191,8 @@ impl fmt::Debug for Frame<PayloadLen> {
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::WebTransportBiStream(bytes) => write!(f, "WebTransportBiStream({})", bytes.len()),
+            Frame::WebTransportUniStream(bytes) => write!(f, "WebTransportUniStream({})", bytes.len()),
             Frame::Grease => write!(f, "Grease()"),
         }
     }
@@ -203,6 +211,8 @@ where
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::WebTransportBiStream(bytes) => write!(f, "WebTransportBiStream({})", bytes.len()),
+            Frame::WebTransportUniStream(bytes) => write!(f, "WebTransportUniStream({})", bytes.len()),
             Frame::Grease => write!(f, "Grease()"),
         }
     }
@@ -254,6 +264,8 @@ frame_types! {
     H2_WINDOW_UPDATE = 0x8,
     H2_CONTINUATION = 0x9,
     MAX_PUSH_ID = 0xD,
+    WEBTRANSPORT_BISTREAM = 0x41,
+    WEBTRANSPORT_UNISTREAM = 0x54,
 }
 
 impl FrameType {
@@ -347,7 +359,9 @@ impl SettingId {
             self,
             SettingId::MAX_HEADER_LIST_SIZE
                 | SettingId::QPACK_MAX_TABLE_CAPACITY
-                | SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                | SettingId::QPACK_MAX_BLOCKED_STREAMS
+                | SettingId::ENABLE_WEBTRANSPORT
+                | SettingId::H3_DATAGRAM,
         )
     }
 
@@ -386,9 +400,12 @@ setting_identifiers! {
     QPACK_MAX_TABLE_CAPACITY = 0x1,
     QPACK_MAX_BLOCKED_STREAMS = 0x7,
     MAX_HEADER_LIST_SIZE = 0x6,
+    H3_DATAGRAM = 0x33,
+    ENABLE_WEBTRANSPORT = 0x2b603742,
+    H3_DATAGRAM_DRAFT04 = 0xffd277,
 }
 
-const SETTINGS_LEN: usize = 4;
+const SETTINGS_LEN: usize = 6;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
@@ -584,6 +601,7 @@ mod tests {
                     (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
                     (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
                     (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+                    (SettingId::ENABLE_WEBTRANSPORT, 0xfad4),
                     (SettingId(95), 0),
                 ],
                 len: 4,
@@ -596,6 +614,7 @@ mod tests {
                     (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
                     (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
                     (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+                    (SettingId::ENABLE_WEBTRANSPORT, 0xfad4),
                     // check without the Grease setting because this is ignored
                     (SettingId(0), 0),
                 ],

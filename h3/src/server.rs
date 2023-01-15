@@ -57,7 +57,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BytesMut, Bytes};
 use futures_util::future;
 use http::{response, HeaderMap, Request, Response, StatusCode};
 use quic::StreamId;
@@ -133,6 +133,21 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    /// Send datagrams.
+    pub async fn send_datagram(
+        &mut self,
+        buf: Bytes,
+    ) -> Result<(), Error> {
+        self.inner.send_datagram(buf)
+    }
+
+    /// Poll for incoming datagrams.
+    pub async fn poll_datagrams(
+        &mut self,
+    ) -> Result<Option<Bytes>, Error> {
+        future::poll_fn(|cx| self.inner.poll_datagrams(cx)).await
+    }
+
     /// Accept an incoming request.
     ///
     /// It returns a tuple with a [`http::Request`] and an [`RequestStream`].
@@ -142,8 +157,9 @@ where
         &mut self,
     ) -> Result<Option<(Request<()>, RequestStream<C::BidiStream, B>)>, Error> {
         // Accept the incoming stream
-        let mut stream = match future::poll_fn(|cx| self.poll_accept_request(cx)).await {
-            Ok(Some(s)) => FrameStream::new(s),
+
+        let stream = match future::poll_fn(|cx| self.poll_accept_request(cx)).await {
+            Ok(Some(s)) => s,
             Ok(None) => {
                 // We always send a last GoAway frame to the client, so it knows which was the last
                 // non-rejected request.
@@ -168,10 +184,20 @@ where
             }
         };
 
+        self.handle_accept_request(stream).await
+    }
+
+    async fn handle_accept_request(
+        &mut self,
+        s: C::BidiStream,
+    ) -> Result<Option<(Request<()>, RequestStream<C::BidiStream, B>)>, Error> {
+        let mut stream = FrameStream::new(s);
         let frame = future::poll_fn(|cx| stream.poll_next(cx)).await;
 
-        let mut encoded = match frame {
-            Ok(Some(Frame::Headers(h))) => h,
+        let (headers, mut encoded) = match frame {
+            Ok(Some(Frame::Headers(h))) => (true, h),
+            Ok(Some(Frame::WebTransportBiStream(h))) => (false, h),
+            Ok(Some(Frame::WebTransportUniStream(h))) => (false, h),
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# If a client-initiated
@@ -246,88 +272,90 @@ where
             ),
         };
 
-        let qpack::Decoded { fields, .. } =
-            match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    request_stream
-                        .send_response(
-                            http::Response::builder()
-                                .status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
-                                .body(())
-                                .expect("header too big response"),
-                        )
-                        .await?;
-                    return Err(Error::header_too_big(
-                        cancel_size,
-                        self.max_field_section_size,
-                    ));
-                }
-                Ok(decoded) => decoded,
-                Err(e) => {
-                    let err: Error = e.into();
-                    if err.is_closed() {
-                        return Ok(None);
+        let mut req = http::Request::new(());
+        if headers {
+            let qpack::Decoded { fields, .. } =
+                match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                    //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                    //# the message header it will accept on an individual HTTP message.
+                    Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                        request_stream
+                            .send_response(
+                                http::Response::builder()
+                                    .status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                                    .body(())
+                                    .expect("header too big response"),
+                            )
+                            .await?;
+                        return Err(Error::header_too_big(
+                            cancel_size,
+                            self.max_field_section_size,
+                        ));
                     }
-                    match err.inner.kind {
-                        crate::error::Kind::Closed => return Ok(None),
-                        crate::error::Kind::Application {
-                            code,
-                            reason,
-                            level: ErrorLevel::ConnectionError,
-                        } => {
-                            return Err(self.inner.close(
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        let err: Error = e.into();
+                        if err.is_closed() {
+                            return Ok(None);
+                        }
+                        match err.inner.kind {
+                            crate::error::Kind::Closed => return Ok(None),
+                            crate::error::Kind::Application {
                                 code,
-                                reason.unwrap_or_else(|| String::into_boxed_str(String::from(""))),
-                            ))
-                        }
-                        crate::error::Kind::Application {
-                            code,
-                            reason: _,
-                            level: ErrorLevel::StreamError,
-                        } => {
-                            request_stream.stop_stream(code);
-                            return Err(err);
-                        }
-                        _ => return Err(err),
-                    };
-                }
-            };
+                                reason,
+                                level: ErrorLevel::ConnectionError,
+                            } => {
+                                return Err(self.inner.close(
+                                    code,
+                                    reason.unwrap_or_else(|| String::into_boxed_str(String::from(""))),
+                                ))
+                            }
+                            crate::error::Kind::Application {
+                                code,
+                                reason: _,
+                                level: ErrorLevel::StreamError,
+                            } => {
+                                request_stream.stop_stream(code);
+                                return Err(err);
+                            }
+                            _ => return Err(err),
+                        };
+                    }
+                };
 
-        // Parse the request headers
-        let (method, uri, headers) = match Header::try_from(fields) {
-            Ok(header) => match header.into_request_parts() {
-                Ok(parts) => parts,
+            // Parse the request headers
+            let (method, uri, headers) = match Header::try_from(fields) {
+                Ok(header) => match header.into_request_parts() {
+                    Ok(parts) => parts,
+                    Err(err) => {
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                        //# Malformed requests or responses that are
+                        //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+                        let error: Error = err.into();
+                        request_stream
+                            .stop_stream(error.try_get_code().unwrap_or(Code::H3_MESSAGE_ERROR));
+                        return Err(error);
+                    }
+                },
                 Err(err) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
                     //# Malformed requests or responses that are
                     //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
                     let error: Error = err.into();
-                    request_stream
-                        .stop_stream(error.try_get_code().unwrap_or(Code::H3_MESSAGE_ERROR));
+                    request_stream.stop_stream(error.try_get_code().unwrap_or(Code::H3_MESSAGE_ERROR));
                     return Err(error);
                 }
-            },
-            Err(err) => {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-                //# Malformed requests or responses that are
-                //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
-                let error: Error = err.into();
-                request_stream.stop_stream(error.try_get_code().unwrap_or(Code::H3_MESSAGE_ERROR));
-                return Err(error);
-            }
-        };
-        //  request_stream.stop_stream(Code::H3_MESSAGE_ERROR).await;
-        let mut req = http::Request::new(());
-        *req.method_mut() = method;
-        *req.uri_mut() = uri;
-        *req.headers_mut() = headers;
-        *req.version_mut() = http::Version::HTTP_3;
+            };
+            //  request_stream.stop_stream(Code::H3_MESSAGE_ERROR).await;
+            *req.method_mut() = method;
+            *req.uri_mut() = uri;
+            *req.headers_mut() = headers;
+            *req.version_mut() = http::Version::HTTP_3;
+        }
+
         // send the grease frame only once
         self.inner.send_grease_frame = false;
-
         Ok(Some((req, request_stream)))
     }
 

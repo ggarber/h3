@@ -218,9 +218,13 @@ impl TryFrom<Vec<HeaderField>> for Header {
                     pseudo.status = Some(s);
                     pseudo.len += 1;
                 }
+                // Ignore protocol field used for WebTransport for now
+                Field::Protocol(_) => {
+                }
                 Field::Header((n, v)) => {
                     fields.append(n, v);
                 }
+
             }
         }
 
@@ -234,6 +238,7 @@ enum Field {
     Authority(Authority),
     Path(PathAndQuery),
     Status(StatusCode),
+    Protocol(String),
     Header((HeaderName, HeaderValue)),
 }
 
@@ -277,6 +282,7 @@ impl Field {
                 StatusCode::from_bytes(value.as_ref())
                     .map_err(|_| HeaderError::invalid_value(name, value))?,
             ),
+            b":protocol" => Field::Protocol(try_value(name, value)?),
             _ => return Err(HeaderError::invalid_name(name)),
         })
     }

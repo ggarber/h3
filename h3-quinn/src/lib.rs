@@ -17,6 +17,7 @@ use futures_util::io::AsyncWrite as _;
 use futures_util::ready;
 use futures_util::stream::StreamExt as _;
 
+use quinn::Datagrams;
 pub use quinn::{
     self, crypto::Session, Endpoint, IncomingBiStreams, IncomingUniStreams, NewConnection, OpenBi,
     OpenUni, VarInt, WriteError,
@@ -33,6 +34,7 @@ pub struct Connection {
     opening_bi: Option<OpenBi>,
     incoming_uni: IncomingUniStreams,
     opening_uni: Option<OpenUni>,
+    datagrams: Datagrams,
 }
 
 impl Connection {
@@ -42,6 +44,7 @@ impl Connection {
             uni_streams,
             bi_streams,
             connection,
+            datagrams,
             ..
         } = new_conn;
 
@@ -51,6 +54,7 @@ impl Connection {
             opening_bi: None,
             incoming_uni: uni_streams,
             opening_uni: None,
+            datagrams: datagrams,
         }
     }
 }
@@ -100,6 +104,20 @@ where
     type BidiStream = BidiStream<B>;
     type OpenStreams = OpenStreams;
     type Error = ConnectionError;
+
+    fn poll_datagrams(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        match ready!(self.datagrams.poll_next_unpin(cx)) {
+            Some(x) => Poll::Ready(Ok(Some(x?))),
+            None => return Poll::Ready(Ok(None)),
+        }
+    }
+
+    fn send_datagram(&mut self, buf: Bytes) -> Result<(), Self::Error> {
+        self.conn.send_datagram(buf).map_err(|_e| ConnectionError(quinn::ConnectionError::LocallyClosed))
+    }
 
     fn poll_accept_bidi(
         &mut self,

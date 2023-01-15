@@ -5,7 +5,7 @@
 
 use std::task::{self, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 pub use crate::proto::stream::{InvalidStreamId, StreamId};
 pub use crate::stream::WriteBuf;
@@ -42,6 +42,14 @@ pub trait Connection<B: Buf> {
     /// Error type yielded by this trait methods
     type Error: Into<Box<dyn Error>>;
 
+    /// Accept incoming datagrams
+    ///
+    /// Returning `None` implies the connection is closing or closed.
+    fn poll_datagrams(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>>;
+
     /// Accept an incoming unidirectional stream
     ///
     /// Returning `None` implies the connection is closing or closed.
@@ -69,6 +77,9 @@ pub trait Connection<B: Buf> {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::SendStream, Self::Error>>;
+
+    /// Send datagram.
+    fn send_datagram(&mut self, buf: Bytes) -> Result<(), Self::Error>;
 
     /// Get an object to open outgoing streams.
     fn opener(&self) -> Self::OpenStreams;

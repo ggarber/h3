@@ -114,6 +114,12 @@ where
         settings
             .insert(SettingId::MAX_HEADER_LIST_SIZE, max_field_section_size)
             .map_err(|e| Code::H3_INTERNAL_ERROR.with_cause(e))?;
+        settings
+            .insert(SettingId::H3_DATAGRAM_DRAFT04, 1)
+            .map_err(|e| Code::H3_INTERNAL_ERROR.with_cause(e))?;
+        settings
+            .insert(SettingId::ENABLE_WEBTRANSPORT, 1)
+            .map_err(|e| Code::H3_INTERNAL_ERROR.with_cause(e))?;
 
         if grease {
             //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
@@ -216,6 +222,33 @@ where
         stream::write(&mut self.control_send, Frame::Goaway(max_id)).await
     }
 
+    pub fn send_datagram(
+        &mut self,
+        buf: Bytes,
+    ) -> Result<(), Error> {
+        {
+            let state = self.shared.read("send_datagram");
+            if let Some(ref e) = state.error {
+                return Err(e.clone());
+            }
+        }
+        self.conn.send_datagram(buf).map_err(|e| e.into().into())
+    }
+
+    pub fn poll_datagrams(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, Error>> {
+        {
+            let state = self.shared.read("poll_datagrams");
+            if let Some(ref e) = state.error {
+                return Poll::Ready(Err(e.clone()));
+            }
+        }
+
+        self.conn.poll_datagrams(cx).map_err(|e| e.into().into())
+    }
+
     pub fn poll_accept_request(
         &mut self,
         cx: &mut Context<'_>,
@@ -226,7 +259,6 @@ where
                 return Poll::Ready(Err(e.clone()));
             }
         }
-
         // .into().into() converts the impl QuicError into crate::error::Error.
         // The `?` operator doesn't work here for some reason.
         self.conn.poll_accept_bidi(cx).map_err(|e| e.into().into())
@@ -323,7 +355,6 @@ where
                 _ => break,
             }
         }
-
         let recvd = ready!(self
             .control_recv
             .as_mut()
